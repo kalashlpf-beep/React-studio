@@ -1,0 +1,961 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Accepter les licences Android
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Generer le projet Android
+        run: |
+          set -e
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ReactionRecorder"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.reaction.recorder"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.reaction.recorder"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("androidx.media3:media3-exoplayer:1.3.1")
+              implementation("androidx.media3:media3-ui:1.3.1")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-view:1.3.4")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <uses-feature
+                  android:name="android.hardware.camera"
+                  android:required="false" />
+
+              <application
+                  android:allowAudioPlaybackCapture="true"
+                  android:allowBackup="false"
+                  android:label="Reaction Recorder"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".RecorderService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection|microphone" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/reaction/recorder
+          cat > app/src/main/java/com/reaction/recorder/ScreenRecorder.kt <<'EOF_FILE'
+          package com.reaction.recorder
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.net.Uri
+          import android.os.ParcelFileDescriptor
+          import android.provider.MediaStore
+          import java.nio.ByteBuffer
+          import java.util.concurrent.atomic.AtomicBoolean
+          import kotlin.concurrent.thread
+
+          /**
+           * Enregistre l'ecran (video + camera en incrustation), la voix du micro
+           * et le son de la video (AudioPlaybackCapture) dans un seul fichier MP4.
+           */
+          class ScreenRecorder(
+              private val context: Context,
+              private val projection: MediaProjection,
+              private val screenWidth: Int,
+              private val screenHeight: Int,
+              private val dpi: Int
+          ) {
+              private val sampleRate = 44100
+              private val running = AtomicBoolean(false)
+              private var stopped = false
+
+              private var videoEncoder: MediaCodec? = null
+              private var audioEncoder: MediaCodec? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var micRecord: AudioRecord? = null
+              private var playbackRecord: AudioRecord? = null
+              private var muxer: MediaMuxer? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var outputUri: Uri? = null
+
+              private var videoThread: Thread? = null
+              private var audioThread: Thread? = null
+
+              private val muxLock = Any()
+              private var videoTrack = -1
+              private var audioTrack = -1
+              private var muxerStarted = false
+              private val pending = ArrayList<PendingSample>()
+
+              private class PendingSample(
+                  val video: Boolean,
+                  val data: ByteArray,
+                  val ptsUs: Long,
+                  val flags: Int
+              )
+
+              fun start() {
+                  // Fichier de sortie dans Films/ReactionRecorder
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, "reaction_" + System.currentTimeMillis() + ".mp4")
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ReactionRecorder")
+                      put(MediaStore.Video.Media.IS_PENDING, 1)
+                  }
+                  val uri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                      ?: throw IllegalStateException("Impossible de creer le fichier video")
+                  outputUri = uri
+                  val descriptor = context.contentResolver.openFileDescriptor(uri, "rw")
+                      ?: throw IllegalStateException("Impossible d'ouvrir le fichier video")
+                  pfd = descriptor
+                  muxer = MediaMuxer(descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+                  // Taille de la video (multiple de 16, 1280 max)
+                  val scale = minOf(1.0, 1280.0 / maxOf(screenWidth, screenHeight))
+                  val w = maxOf(16, ((screenWidth * scale).toInt() / 16) * 16)
+                  val h = maxOf(16, ((screenHeight * scale).toInt() / 16) * 16)
+
+                  val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+                      setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                      setInteger(MediaFormat.KEY_BIT_RATE, 5_000_000)
+                      setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                  }
+                  val vEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                  vEnc.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                  val inputSurface = vEnc.createInputSurface()
+                  vEnc.start()
+                  videoEncoder = vEnc
+
+                  virtualDisplay = projection.createVirtualDisplay(
+                      "reaction-recorder", w, h, dpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      inputSurface, null, null
+                  )
+
+                  // Audio : micro + son de la video
+                  val minBuf = AudioRecord.getMinBufferSize(
+                      sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val bufSize = maxOf(minBuf, 8192) * 2
+                  val pcmFormat = AudioFormat.Builder()
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setSampleRate(sampleRate)
+                      .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                      .build()
+
+                  micRecord = AudioRecord.Builder()
+                      .setAudioSource(MediaRecorder.AudioSource.MIC)
+                      .setAudioFormat(pcmFormat)
+                      .setBufferSizeInBytes(bufSize)
+                      .build()
+
+                  playbackRecord = try {
+                      val cfg = AudioPlaybackCaptureConfiguration.Builder(projection)
+                          .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                          .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                          .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                          .build()
+                      AudioRecord.Builder()
+                          .setAudioFormat(pcmFormat)
+                          .setBufferSizeInBytes(bufSize)
+                          .setAudioPlaybackCaptureConfig(cfg)
+                          .build()
+                  } catch (e: Exception) {
+                      null // on continue avec le micro seulement
+                  }
+
+                  val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
+                      setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                      setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+                      setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                  }
+                  val aEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                  aEnc.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                  aEnc.start()
+                  audioEncoder = aEnc
+
+                  running.set(true)
+                  micRecord?.startRecording()
+                  playbackRecord?.startRecording()
+                  videoThread = thread(name = "video-drain") { drainVideo() }
+                  audioThread = thread(name = "audio-loop") { audioLoop() }
+              }
+
+              /** Arrete tout en meme temps et renvoie l'URI de la video (ou null si echec). */
+              fun stop(): Uri? {
+                  if (stopped) return null
+                  stopped = true
+                  running.set(false)
+
+                  try { audioThread?.join(4000) } catch (e: Exception) { }
+                  try { videoEncoder?.signalEndOfInputStream() } catch (e: Exception) { }
+                  try { videoThread?.join(4000) } catch (e: Exception) { }
+
+                  try { virtualDisplay?.release() } catch (e: Exception) { }
+                  try { micRecord?.stop() } catch (e: Exception) { }
+                  try { micRecord?.release() } catch (e: Exception) { }
+                  try { playbackRecord?.stop() } catch (e: Exception) { }
+                  try { playbackRecord?.release() } catch (e: Exception) { }
+                  try { videoEncoder?.stop() } catch (e: Exception) { }
+                  try { videoEncoder?.release() } catch (e: Exception) { }
+                  try { audioEncoder?.stop() } catch (e: Exception) { }
+                  try { audioEncoder?.release() } catch (e: Exception) { }
+
+                  var ok = false
+                  synchronized(muxLock) {
+                      if (muxerStarted) {
+                          try { muxer?.stop(); ok = true } catch (e: Exception) { }
+                      }
+                      try { muxer?.release() } catch (e: Exception) { }
+                  }
+                  try { pfd?.close() } catch (e: Exception) { }
+
+                  val uri = outputUri ?: return null
+                  return if (ok) {
+                      try {
+                          val v = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                          context.contentResolver.update(uri, v, null, null)
+                      } catch (e: Exception) { }
+                      uri
+                  } else {
+                      try { context.contentResolver.delete(uri, null, null) } catch (e: Exception) { }
+                      null
+                  }
+              }
+
+              // ---------- Video ----------
+
+              private fun drainVideo() {
+                  val enc = videoEncoder ?: return
+                  val info = MediaCodec.BufferInfo()
+                  var baseUs = -1L
+                  while (true) {
+                      val idx = try {
+                          enc.dequeueOutputBuffer(info, 10_000)
+                      } catch (e: Exception) {
+                          break
+                      }
+                      if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          synchronized(muxLock) {
+                              videoTrack = muxer!!.addTrack(enc.outputFormat)
+                              startMuxerIfReady()
+                          }
+                      } else if (idx >= 0) {
+                          val buf = enc.getOutputBuffer(idx)
+                          val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                          if (buf != null && info.size > 0 && !isConfig) {
+                              if (baseUs < 0) baseUs = info.presentationTimeUs
+                              writeSample(true, buf, info, info.presentationTimeUs - baseUs)
+                          }
+                          enc.releaseOutputBuffer(idx, false)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                      }
+                  }
+              }
+
+              // ---------- Audio ----------
+
+              private fun audioLoop() {
+                  val enc = audioEncoder ?: return
+                  val mic = micRecord ?: return
+                  val play = playbackRecord
+                  val n = 1024
+                  val micBuf = ShortArray(n)
+                  val playBuf = ShortArray(n)
+                  val bytes = ByteArray(n * 2)
+                  val info = MediaCodec.BufferInfo()
+                  var samples = 0L
+
+                  while (running.get()) {
+                      val m = mic.read(micBuf, 0, n).coerceAtLeast(0)
+                      val p = if (play != null) play.read(playBuf, 0, n).coerceAtLeast(0) else 0
+                      if (m == 0 && p == 0) {
+                          try { Thread.sleep(10) } catch (e: Exception) { }
+                          continue
+                      }
+                      for (i in 0 until n) {
+                          val a = if (i < m) micBuf[i].toInt() else 0
+                          val b = if (i < p) playBuf[i].toInt() else 0
+                          val s = (a + b * 7 / 10).coerceIn(-32768, 32767)
+                          bytes[2 * i] = (s and 0xFF).toByte()
+                          bytes[2 * i + 1] = ((s shr 8) and 0xFF).toByte()
+                      }
+                      feedAudio(enc, bytes, n * 2, samples * 1_000_000L / sampleRate, false, info)
+                      samples += n
+                  }
+
+                  // Fin du flux audio
+                  feedAudio(enc, ByteArray(0), 0, samples * 1_000_000L / sampleRate, true, info)
+                  var tries = 0
+                  while (tries < 300) {
+                      if (drainAudio(enc, info, 10_000)) break
+                      tries++
+                  }
+              }
+
+              private fun feedAudio(
+                  enc: MediaCodec, data: ByteArray, size: Int, ptsUs: Long,
+                  eos: Boolean, info: MediaCodec.BufferInfo
+              ) {
+                  var fed = false
+                  var guard = 0
+                  while (!fed && guard < 500) {
+                      guard++
+                      val inIdx = enc.dequeueInputBuffer(10_000)
+                      if (inIdx >= 0) {
+                          val inBuf = enc.getInputBuffer(inIdx)
+                          if (inBuf != null) {
+                              inBuf.clear()
+                              inBuf.put(data, 0, size)
+                          }
+                          enc.queueInputBuffer(
+                              inIdx, 0, size, ptsUs,
+                              if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                          )
+                          fed = true
+                      }
+                      if (!eos) drainAudio(enc, info, 0)
+                  }
+              }
+
+              /** Vide les sorties disponibles. Renvoie true quand la fin du flux est atteinte. */
+              private fun drainAudio(enc: MediaCodec, info: MediaCodec.BufferInfo, timeoutUs: Long): Boolean {
+                  while (true) {
+                      val idx = enc.dequeueOutputBuffer(info, timeoutUs)
+                      if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) return false
+                      if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          synchronized(muxLock) {
+                              audioTrack = muxer!!.addTrack(enc.outputFormat)
+                              startMuxerIfReady()
+                          }
+                      } else if (idx >= 0) {
+                          val buf = enc.getOutputBuffer(idx)
+                          val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                          if (buf != null && info.size > 0 && !isConfig) {
+                              writeSample(false, buf, info, info.presentationTimeUs)
+                          }
+                          enc.releaseOutputBuffer(idx, false)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return true
+                      }
+                  }
+              }
+
+              // ---------- Muxer ----------
+
+              private fun writeSample(video: Boolean, buf: ByteBuffer, info: MediaCodec.BufferInfo, ptsUs: Long) {
+                  val flags = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv()
+                  buf.position(info.offset)
+                  buf.limit(info.offset + info.size)
+                  synchronized(muxLock) {
+                      if (muxerStarted) {
+                          val bi = MediaCodec.BufferInfo()
+                          bi.set(info.offset, info.size, maxOf(0L, ptsUs), flags)
+                          muxer!!.writeSampleData(if (video) videoTrack else audioTrack, buf, bi)
+                      } else {
+                          val bytes = ByteArray(info.size)
+                          buf.get(bytes)
+                          pending.add(PendingSample(video, bytes, maxOf(0L, ptsUs), flags))
+                      }
+                  }
+              }
+
+              // A appeler dans synchronized(muxLock)
+              private fun startMuxerIfReady() {
+                  if (muxerStarted || videoTrack < 0 || audioTrack < 0) return
+                  muxer!!.start()
+                  muxerStarted = true
+                  for (p in pending) {
+                      val bi = MediaCodec.BufferInfo()
+                      bi.set(0, p.data.size, p.ptsUs, p.flags)
+                      muxer!!.writeSampleData(if (p.video) videoTrack else audioTrack, ByteBuffer.wrap(p.data), bi)
+                  }
+                  pending.clear()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/reaction/recorder
+          cat > app/src/main/java/com/reaction/recorder/RecorderService.kt <<'EOF_FILE'
+          package com.reaction.recorder
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import androidx.core.content.IntentCompat
+          import kotlin.concurrent.thread
+
+          class RecorderService : Service() {
+
+              interface Listener {
+                  fun onStarted()
+                  fun onFinished(uri: Uri?)
+                  fun onError(message: String)
+              }
+
+              companion object {
+                  const val ACTION_START = "com.reaction.recorder.START"
+                  const val ACTION_STOP = "com.reaction.recorder.STOP"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+                  const val EXTRA_W = "w"
+                  const val EXTRA_H = "h"
+                  const val EXTRA_DPI = "dpi"
+                  private const val CHANNEL_ID = "reaction_recorder"
+
+                  @Volatile
+                  var listener: Listener? = null
+
+                  @Volatile
+                  var isRecording = false
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private var projection: MediaProjection? = null
+              private var recorder: ScreenRecorder? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_START -> startRecording(intent)
+                      ACTION_STOP -> stopRecording()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startRecording(intent: Intent) {
+                  val channel = NotificationChannel(CHANNEL_ID, "Enregistrement", NotificationManager.IMPORTANCE_LOW)
+                  (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+
+                  val notification = Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("Reaction Recorder")
+                      .setContentText("Enregistrement en cours")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setOngoing(true)
+                      .build()
+
+                  var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  }
+                  startForeground(1, notification, type)
+
+                  val code = intent.getIntExtra(EXTRA_CODE, 0)
+                  val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+                  if (data == null) {
+                      fail("Autorisation d'enregistrement manquante")
+                      return
+                  }
+
+                  try {
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val proj = mpm.getMediaProjection(code, data)
+                      projection = proj
+                      proj.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              stopRecording()
+                          }
+                      }, main)
+
+                      val rec = ScreenRecorder(
+                          this, proj,
+                          intent.getIntExtra(EXTRA_W, 1080),
+                          intent.getIntExtra(EXTRA_H, 1920),
+                          intent.getIntExtra(EXTRA_DPI, 320)
+                      )
+                      recorder = rec
+                      rec.start()
+                      isRecording = true
+                      main.post { listener?.onStarted() }
+                  } catch (e: Exception) {
+                      try { recorder?.stop() } catch (e2: Exception) { }
+                      recorder = null
+                      fail("Erreur : " + e.message)
+                  }
+              }
+
+              private fun stopRecording() {
+                  val rec = recorder ?: return
+                  recorder = null
+                  isRecording = false
+                  thread(name = "recorder-stop") {
+                      val uri = try { rec.stop() } catch (e: Exception) { null }
+                      try { projection?.stop() } catch (e: Exception) { }
+                      projection = null
+                      main.post {
+                          listener?.onFinished(uri)
+                          stopForeground(STOP_FOREGROUND_REMOVE)
+                          stopSelf()
+                      }
+                  }
+              }
+
+              private fun fail(message: String) {
+                  isRecording = false
+                  try { projection?.stop() } catch (e: Exception) { }
+                  projection = null
+                  main.post {
+                      listener?.onError(message)
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                  }
+              }
+
+              override fun onDestroy() {
+                  recorder?.let {
+                      try { it.stop() } catch (e: Exception) { }
+                  }
+                  recorder = null
+                  isRecording = false
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/reaction/recorder
+          cat > app/src/main/java/com/reaction/recorder/MainActivity.kt <<'EOF_FILE'
+          package com.reaction.recorder
+
+          import android.Manifest
+          import android.content.ClipData
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Outline
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.ViewOutlineProvider
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.ui.PlayerView
+
+          class MainActivity : AppCompatActivity(), RecorderService.Listener {
+
+              private lateinit var playerView: PlayerView
+              private lateinit var cameraView: PreviewView
+              private lateinit var bar: LinearLayout
+              private lateinit var txtHint: TextView
+              private lateinit var btnPick: Button
+              private lateinit var btnRec: Button
+              private lateinit var btnPlay: Button
+              private lateinit var btnStop: Button
+              private lateinit var btnShare: Button
+
+              private var player: ExoPlayer? = null
+              private var hasVideo = false
+              private var recording = false
+              private var lastUri: Uri? = null
+
+              private val pickVideo =
+                  registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                      if (uri != null) loadVideo(uri)
+                  }
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                      if (hasPerms()) startCamera() else toast("La caméra et le micro sont nécessaires")
+                  }
+
+              private val projectionLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                      val data = r.data
+                      if (r.resultCode == RESULT_OK && data != null) {
+                          launchService(r.resultCode, data)
+                      } else {
+                          toast("Autorisation d'enregistrement refusée")
+                      }
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  buildUi()
+                  val controller = WindowInsetsControllerCompat(window, window.decorView)
+                  controller.hide(WindowInsetsCompat.Type.systemBars())
+                  controller.systemBarsBehavior =
+                      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+                  RecorderService.listener = this
+                  recording = RecorderService.isRecording
+                  if (hasPerms()) startCamera() else permLauncher.launch(requiredPerms())
+                  updateUi()
+              }
+
+              // ---------- Interface ----------
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun makeButton(label: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun buildUi() {
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(Color.BLACK)
+                  // Pendant l'enregistrement, toucher l'écran met la vidéo en pause / lecture
+                  root.setOnClickListener { if (recording) togglePlay() }
+
+                  playerView = PlayerView(this)
+                  playerView.useController = false
+                  playerView.setBackgroundColor(Color.BLACK)
+                  root.addView(playerView, FrameLayout.LayoutParams(match, match))
+
+                  cameraView = PreviewView(this)
+                  cameraView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                  cameraView.scaleType = PreviewView.ScaleType.FILL_CENTER
+                  cameraView.outlineProvider = object : ViewOutlineProvider() {
+                      override fun getOutline(view: View, outline: Outline) {
+                          outline.setRoundRect(0, 0, view.width, view.height, dp(16).toFloat())
+                      }
+                  }
+                  cameraView.clipToOutline = true
+                  val camLp = FrameLayout.LayoutParams(dp(110), dp(150), Gravity.TOP or Gravity.END)
+                  camLp.setMargins(0, dp(40), dp(12), 0)
+                  root.addView(cameraView, camLp)
+
+                  txtHint = TextView(this)
+                  txtHint.setTextColor(Color.WHITE)
+                  txtHint.textSize = 18f
+                  txtHint.gravity = Gravity.CENTER
+                  txtHint.setPadding(dp(32), 0, dp(32), 0)
+                  root.addView(txtHint, FrameLayout.LayoutParams(match, wrap, Gravity.CENTER))
+
+                  btnPick = makeButton("Choisir une vidéo") { pickVideo.launch(arrayOf("video/*")) }
+                  btnRec = makeButton("● Démarrer") { onRecClicked() }
+                  btnPlay = makeButton("Pause / Lecture") { togglePlay() }
+                  btnStop = makeButton("■ Terminer") { onStopClicked() }
+                  btnShare = makeButton("Partager") { shareVideo() }
+
+                  bar = LinearLayout(this)
+                  bar.orientation = LinearLayout.HORIZONTAL
+                  bar.gravity = Gravity.CENTER
+                  bar.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  for (b in listOf(btnPick, btnRec, btnPlay, btnStop, btnShare)) {
+                      bar.addView(b, LinearLayout.LayoutParams(0, wrap, 1f))
+                  }
+                  val barLp = FrameLayout.LayoutParams(match, wrap, Gravity.BOTTOM)
+                  barLp.bottomMargin = dp(24)
+                  root.addView(bar, barLp)
+
+                  setContentView(root)
+              }
+
+              private fun updateUi() {
+                  val idle = if (recording) View.GONE else View.VISIBLE
+                  val live = if (recording) View.VISIBLE else View.GONE
+                  btnPick.visibility = idle
+                  btnRec.visibility = idle
+                  btnRec.isEnabled = hasVideo
+                  btnPlay.visibility = live
+                  btnStop.visibility = live
+                  btnStop.isEnabled = true
+                  btnShare.visibility = if (!recording && lastUri != null) View.VISIBLE else View.GONE
+                  bar.alpha = if (recording) 0.45f else 1f
+
+                  txtHint.visibility = if (recording) View.GONE else View.VISIBLE
+                  txtHint.text = when {
+                      !hasVideo -> "Choisis la vidéo à commenter"
+                      lastUri != null -> "Vidéo enregistrée dans Films/ReactionRecorder.\nAppuie sur Partager pour la poster."
+                      else -> "Appuie sur Démarrer : l'enregistrement commence et la vidéo se lance.\nPendant l'enregistrement, touche l'écran pour mettre la vidéo en pause."
+                  }
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+              }
+
+              // ---------- Permissions et caméra ----------
+
+              private fun requiredPerms(): Array<String> {
+                  val list = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
+                  return list.toTypedArray()
+              }
+
+              private fun hasPerms(): Boolean {
+                  val cam = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                  val mic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                  return cam == PackageManager.PERMISSION_GRANTED && mic == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      try {
+                          val provider = future.get()
+                          val preview = Preview.Builder().build()
+                          preview.setSurfaceProvider(cameraView.surfaceProvider)
+                          provider.unbindAll()
+                          provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, preview)
+                      } catch (e: Exception) {
+                          toast("Caméra indisponible : " + e.message)
+                      }
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              // ---------- Vidéo source ----------
+
+              private fun loadVideo(uri: Uri) {
+                  val p = player ?: ExoPlayer.Builder(this).build().also {
+                      it.setAudioAttributes(androidx.media3.common.AudioAttributes.DEFAULT, true)
+                      it.addListener(object : Player.Listener {
+                          override fun onPlaybackStateChanged(state: Int) {
+                              if (state == Player.STATE_ENDED && recording) {
+                                  toast("Vidéo terminée : appuie sur ■ Terminer pour finir")
+                              }
+                          }
+                      })
+                      player = it
+                      playerView.player = it
+                  }
+                  p.setMediaItem(MediaItem.fromUri(uri))
+                  p.prepare()
+                  p.playWhenReady = false
+                  hasVideo = true
+                  lastUri = null
+                  updateUi()
+              }
+
+              private fun togglePlay() {
+                  val p = player ?: return
+                  if (p.isPlaying) p.pause() else p.play()
+              }
+
+              // ---------- Enregistrement ----------
+
+              private fun onRecClicked() {
+                  if (!hasVideo) {
+                      toast("Choisis d'abord une vidéo")
+                      return
+                  }
+                  if (!hasPerms()) {
+                      permLauncher.launch(requiredPerms())
+                      return
+                  }
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projectionLauncher.launch(mpm.createScreenCaptureIntent())
+              }
+
+              private fun launchService(resultCode: Int, data: Intent) {
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  windowManager.defaultDisplay.getRealMetrics(dm)
+
+                  val i = Intent(this, RecorderService::class.java)
+                  i.action = RecorderService.ACTION_START
+                  i.putExtra(RecorderService.EXTRA_CODE, resultCode)
+                  i.putExtra(RecorderService.EXTRA_DATA, data)
+                  i.putExtra(RecorderService.EXTRA_W, dm.widthPixels)
+                  i.putExtra(RecorderService.EXTRA_H, dm.heightPixels)
+                  i.putExtra(RecorderService.EXTRA_DPI, dm.densityDpi)
+
+                  recording = true
+                  lastUri = null
+                  updateUi()
+                  ContextCompat.startForegroundService(this, i)
+              }
+
+              private fun onStopClicked() {
+                  player?.pause()
+                  btnStop.isEnabled = false
+                  val i = Intent(this, RecorderService::class.java)
+                  i.action = RecorderService.ACTION_STOP
+                  startService(i)
+              }
+
+              private fun shareVideo() {
+                  val uri = lastUri ?: return
+                  val send = Intent(Intent.ACTION_SEND)
+                  send.type = "video/mp4"
+                  send.putExtra(Intent.EXTRA_STREAM, uri)
+                  send.clipData = ClipData.newRawUri("", uri)
+                  send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  startActivity(Intent.createChooser(send, "Partager la vidéo"))
+              }
+
+              // ---------- Retours du service ----------
+
+              override fun onStarted() {
+                  recording = true
+                  player?.play()
+                  updateUi()
+              }
+
+              override fun onFinished(uri: Uri?) {
+                  recording = false
+                  player?.pause()
+                  lastUri = uri
+                  updateUi()
+                  if (uri == null) toast("L'enregistrement a échoué")
+              }
+
+              override fun onError(message: String) {
+                  recording = false
+                  updateUi()
+                  toast(message)
+              }
+
+              override fun onDestroy() {
+                  if (RecorderService.listener === this) RecorderService.listener = null
+                  player?.release()
+                  player = null
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+
+      - name: Compiler l'APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Envoyer l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReactionRecorder-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
